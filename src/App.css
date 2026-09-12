@@ -179,6 +179,87 @@
   font-variant-numeric: tabular-nums;
 }
 
+.expand-btn {
+  border: none;
+  background: var(--bg);
+  color: var(--text-muted);
+  border-radius: 8px;
+  width: 26px;
+  height: 26px;
+  font-size: 14px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 130ms cubic-bezier(0.34, 1.56, 0.64, 1), color 150ms ease;
+}
+
+.expand-btn:hover {
+  color: var(--accent);
+}
+
+.expand-btn:active {
+  transform: scale(0.9);
+}
+
+/* Expanded (large) 3D view */
+.expanded-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+}
+
+.expanded-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.expanded-head h2 {
+  font-size: 17px;
+  font-weight: 800;
+}
+
+.expanded-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.expand-close-btn {
+  border: none;
+  background: var(--card-bg);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 700;
+  box-shadow: var(--shadow-card);
+}
+
+.expand-close-btn:active {
+  transform: scale(0.96);
+}
+
+.expanded-canvas-wrap {
+  position: relative;
+  flex: 1;
+  border-radius: 16px;
+  overflow: hidden;
+  background: #0c0d10;
+}
+
+.expanded-canvas-wrap canvas {
+  display: block;
+  touch-action: none;
+}
+
 .canvas-wrap {
   position: relative;
   width: 100%;

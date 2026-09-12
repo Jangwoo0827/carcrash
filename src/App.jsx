@@ -2,6 +2,7 @@ import { useState } from "react";
 import "./App.css";
 import ControlPanel from "./components/ControlPanel";
 import IntersectionPanel from "./components/IntersectionPanel";
+import ExpandedPanel from "./components/ExpandedPanel";
 import MetricsPanel from "./components/MetricsPanel";
 import AiLog from "./components/AiLog";
 import ComparisonChart from "./components/ComparisonChart";
@@ -12,6 +13,7 @@ export default function App() {
   const [speed, setSpeed] = useState(2);
   const [running, setRunning] = useState(true);
   const [viewMode, setViewMode] = useState("3d");
+  const [expanded, setExpanded] = useState(null); // null | "fixed" | "ai"
 
   const { fixed, ai, history, reset } = useTrafficDuel({ scenarioId, speed, running });
 
@@ -42,15 +44,34 @@ export default function App() {
         onViewModeChange={setViewMode}
       />
 
-      <div className="duel-grid">
-        <IntersectionPanel title="고정 신호 (기존 방식)" state={fixed} viewMode={viewMode} />
-        <IntersectionPanel
-          title="AI 적응형 신호"
-          state={ai}
+      {!expanded && (
+        <div className="duel-grid">
+          <IntersectionPanel
+            title="고정 신호 (기존 방식)"
+            state={fixed}
+            viewMode={viewMode}
+            onExpand={() => setExpanded("fixed")}
+          />
+          <IntersectionPanel
+            title="AI 적응형 신호"
+            state={ai}
+            viewMode={viewMode}
+            badge={<span className="badge-ai">AI</span>}
+            onExpand={() => setExpanded("ai")}
+          />
+        </div>
+      )}
+
+      {expanded && (
+        <ExpandedPanel
+          title={expanded === "fixed" ? "고정 신호 (기존 방식)" : "AI 적응형 신호"}
+          badge={expanded === "ai" ? <span className="badge-ai">AI</span> : null}
+          state={expanded === "fixed" ? fixed : ai}
           viewMode={viewMode}
-          badge={<span className="badge-ai">AI</span>}
+          onViewModeChange={setViewMode}
+          onClose={() => setExpanded(null)}
         />
-      </div>
+      )}
 
       <div className="bottom-grid">
         <MetricsPanel fixed={fixed} ai={ai} />
