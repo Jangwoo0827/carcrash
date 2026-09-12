@@ -1,6 +1,7 @@
 import { SCENARIO_LIST } from "../utils/scenarios";
 
-const SPEEDS = [1, 2, 4, 8, 16];
+const SPEED_PRESETS = [1, 2, 4, 8, 16, 32, 64];
+const MAX_SPEED = 64;
 
 export default function ControlPanel({
   scenarioId,
@@ -10,6 +11,8 @@ export default function ControlPanel({
   running,
   onToggleRunning,
   onReset,
+  viewMode,
+  onViewModeChange,
 }) {
   return (
     <div className="control-panel">
@@ -29,9 +32,9 @@ export default function ControlPanel({
       </div>
 
       <div className="control-group">
-        <span className="control-label">재생 속도</span>
+        <span className="control-label">재생 속도 (직접 입력 가능, 최대 {MAX_SPEED}x)</span>
         <div className="chip-row">
-          {SPEEDS.map((s) => (
+          {SPEED_PRESETS.map((s) => (
             <button
               key={s}
               className={`chip ${speed === s ? "chip-active" : ""}`}
@@ -40,6 +43,47 @@ export default function ControlPanel({
               {s}x
             </button>
           ))}
+        </div>
+        <div className="speed-slider-row">
+          <input
+            type="range"
+            min="1"
+            max={MAX_SPEED}
+            step="1"
+            value={Math.min(MAX_SPEED, Math.round(speed))}
+            onChange={(e) => onSpeedChange(Number(e.target.value))}
+            className="speed-slider"
+          />
+          <input
+            type="number"
+            min="1"
+            max={MAX_SPEED}
+            value={speed}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              if (!Number.isNaN(v)) onSpeedChange(Math.max(1, Math.min(MAX_SPEED, v)));
+            }}
+            className="speed-number"
+          />
+          <span className="speed-unit">x</span>
+        </div>
+      </div>
+
+      <div className="control-group">
+        <span className="control-label">보기 모드</span>
+        <div className="chip-row">
+          <button
+            className={`chip ${viewMode === "2d" ? "chip-active" : ""}`}
+            onClick={() => onViewModeChange("2d")}
+          >
+            🔲 2D (탑뷰)
+          </button>
+          <button
+            className={`chip ${viewMode === "3d" ? "chip-active" : ""}`}
+            onClick={() => onViewModeChange("3d")}
+          >
+            🧊 3D (드래그로 회전)
+          </button>
         </div>
       </div>
 

@@ -23,7 +23,11 @@ const HEADWAY_TURN = 2.6; // turning vehicles clear the stop line a bit slower
 // "smart" controller worse than a boring fixed cycle. Only switch early for a
 // real imbalance, not a queue that's 2-3 cars ahead.
 const GAP_THRESHOLD = 8;
-const LOG_LIMIT = 8;
+const LOG_LIMIT = 10;
+const EWMA_TAU = 10; // seconds — smoothing window for the AI's own arrival-rate estimate
+const LOOKAHEAD = 8; // seconds — how far ahead the AI projects queue growth
+const STARVATION_LIMIT = 55; // seconds — nobody should wait longer than this, no matter what
+const THOUGHT_INTERVAL = 6; // seconds between "still thinking" log entries while holding a phase
 
 const CROSS_DURATION = { through: 1.8, left: 2.6, right: 2.2, uturn: 3.0 };
 // Movement mix for newly-arriving traffic on any approach.
@@ -74,6 +78,10 @@ export function createSimState(seed) {
     yellow: false,
     yellowElapsed: 0,
     lastSwitchReason: null,
+    arrivalEwma: { N: 0, S: 0, E: 0, W: 0 },
+    confidence: 50,
+    lastThoughtAt: -THOUGHT_INTERVAL,
+    queueSnapshot: { N: 0, S: 0, E: 0, W: 0 },
     stats: {
       departed: { N: 0, S: 0, E: 0, W: 0 },
       totalWait: { N: 0, S: 0, E: 0, W: 0 },
@@ -83,8 +91,8 @@ export function createSimState(seed) {
   };
 }
 
-function pushLog(state, message) {
-  state.stats.log.push({ id: `${state.time.toFixed(1)}-${message}`, time: state.time, message });
+function pushLog(state, message, kind = "switch") {
+  state.stats.log.push({ id: `${state.time.toFixed(2)}-${message}`, time: state.time, message, kind });
   if (state.stats.log.length > LOG_LIMIT) state.stats.log.shift();
 }
 
@@ -124,28 +132,95 @@ export function fixedController(state) {
   return state.phaseElapsed >= FIXED_GREEN;
 }
 
+function trendArrow(current, previous) {
+  if (current > previous) return "↑";
+  if (current < previous) return "↓";
+  return "→";
+}
+
+/** The AI's own estimate of arrivals/sec, projected `seconds` into the future. */
+function forecastQueueLength(state, approach, seconds) {
+  return approachQueueLength(state, approach) + state.arrivalEwma[approach] * seconds;
+}
+
+function oldestThroughWait(state, approach) {
+  const q = state.queues[approach].through;
+  if (q.length === 0) return 0;
+  let oldest = q[0].spawnTime;
+  for (const v of q) if (v.spawnTime < oldest) oldest = v.spawnTime;
+  return state.time - oldest;
+}
+
+/** Bigger imbalance (either direction) = the AI is more sure its current call is right. */
+function computeConfidence(greenQueue, redQueue) {
+  return Math.max(8, Math.min(97, Math.round(50 + Math.abs(redQueue - greenQueue) * 6)));
+}
+
+function logThought(state, greenQueue, redQueue) {
+  if (state.time - state.lastThoughtAt < THOUGHT_INTERVAL) return;
+  state.lastThoughtAt = state.time;
+
+  const green = PHASES[state.phase];
+  const red = PHASES[otherPhase(state.phase)];
+  const prev = state.queueSnapshot;
+  const greenTrend = green
+    .map((a) => `${APPROACH_LABEL[a]}${approachQueueLength(state, a)}대${trendArrow(approachQueueLength(state, a), prev[a])}`)
+    .join(" ");
+  const redTrend = red
+    .map((a) => `${APPROACH_LABEL[a]}${approachQueueLength(state, a)}대${trendArrow(approachQueueLength(state, a), prev[a])}`)
+    .join(" ");
+  const redForecast = red.reduce((s, a) => s + forecastQueueLength(state, a, LOOKAHEAD), 0);
+  const inflowPct = redQueue > 0 ? Math.round(((redForecast - redQueue) / redQueue) * 100) : redForecast > 0 ? 100 : 0;
+
+  for (const a of APPROACHES) state.queueSnapshot[a] = approachQueueLength(state, a);
+
+  pushLog(
+    state,
+    `[${PHASE_LABEL[state.phase]} 진행 ${Math.floor(state.phaseElapsed)}s] 현재측 ${greenTrend} · 반대측 ${redTrend} (${LOOKAHEAD}초 후 예상 유입 ${inflowPct >= 0 ? "+" : ""}${inflowPct}%) · 확신도 ${state.confidence}% → 유지`,
+    "thought"
+  );
+}
+
 /**
  * Adaptive controller: gap-out / max-out actuated control, the same principle
  * real "smart" signal controllers use — extend green while it's still being
  * used, cut it short once the queue clears, and never starve the other side.
+ * Layered on top: an EWMA arrival-rate forecast, a confidence estimate, and a
+ * hard fairness backstop so no single vehicle waits forever.
  */
 export function adaptiveController(state) {
-  if (state.phaseElapsed < MIN_GREEN) return null;
-
   const green = PHASES[state.phase];
   const red = PHASES[otherPhase(state.phase)];
   const greenQueue = green.reduce((s, a) => s + approachQueueLength(state, a), 0);
   const redQueue = red.reduce((s, a) => s + approachQueueLength(state, a), 0);
+  state.confidence = computeConfidence(greenQueue, redQueue);
+
+  // Fairness backstop: a single starved vehicle overrides everything else,
+  // even the minimum-green lockout — extreme, but nobody should wait 55s+.
+  const redOldestWait = Math.max(0, ...red.map((a) => oldestThroughWait(state, a)));
+  if (redOldestWait >= STARVATION_LIMIT) {
+    state.confidence = 99;
+    return `⚖️ 공정성 개입: ${PHASE_LABEL[otherPhase(state.phase)]} 방향 차량이 ${Math.round(redOldestWait)}초째 대기 → 즉시 전환`;
+  }
+
+  if (state.phaseElapsed < MIN_GREEN) return null;
 
   if (state.phaseElapsed >= MAX_GREEN) {
+    state.confidence = 65;
     return `${PHASE_LABEL[state.phase]} 방향 최대 녹색시간(${MAX_GREEN}s) 도달 → 전환`;
   }
   if (greenQueue === 0 && redQueue > 0) {
+    state.confidence = 95;
     return `${PHASE_LABEL[state.phase]} 방향 대기 차량 없음 → 조기 전환`;
   }
-  if (redQueue - greenQueue >= GAP_THRESHOLD) {
-    return `반대편 대기 ${redQueue}대 vs 현재 ${greenQueue}대 → ${PHASE_LABEL[otherPhase(state.phase)]}로 전환`;
+
+  const redForecast = red.reduce((s, a) => s + forecastQueueLength(state, a, LOOKAHEAD), 0);
+  const forecastGap = redForecast - greenQueue;
+  if (redQueue - greenQueue >= GAP_THRESHOLD || forecastGap >= GAP_THRESHOLD + 4) {
+    return `반대편 대기 ${redQueue}대(${LOOKAHEAD}초 후 약 ${Math.round(redForecast)}대 예상) vs 현재 ${greenQueue}대 · 확신도 ${state.confidence}% → ${PHASE_LABEL[otherPhase(state.phase)]}로 전환`;
   }
+
+  logThought(state, greenQueue, redQueue);
   return null;
 }
 
@@ -176,8 +251,10 @@ function departVehicle(state, approach, lane) {
 export function stepSimulation(state, dt, { arrivalRates, controller }) {
   state.time += dt;
 
-  // 1. Vehicle arrivals
+  // 1. Vehicle arrivals — also feeds the AI's own EWMA estimate of arrival
+  // rate per approach (decay-then-impulse, converges to the true rate).
   for (const a of APPROACHES) {
+    state.arrivalEwma[a] *= Math.exp(-dt / EWMA_TAU);
     const rate = arrivalRates[a] ?? 0;
     let expected = (rate / 60) * dt;
     while (expected > 0) {
@@ -185,6 +262,7 @@ export function stepSimulation(state, dt, { arrivalRates, controller }) {
       if (state.rng() < chunk) {
         const movement = pickMovement(state.rng);
         state.queues[a][LANE_OF[movement]].push({ id: state.nextId++, spawnTime: state.time, movement });
+        state.arrivalEwma[a] += 1 / EWMA_TAU;
       }
       expected -= 1;
     }
