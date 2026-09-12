@@ -1,14 +1,14 @@
 import { useState } from "react";
 import "./App.css";
 import ControlPanel from "./components/ControlPanel";
-import IntersectionView from "./components/IntersectionView";
+import Intersection3D from "./components/Intersection3D";
 import MetricsPanel from "./components/MetricsPanel";
 import AiLog from "./components/AiLog";
 import { useTrafficDuel } from "./hooks/useTrafficDuel";
 
 export default function App() {
   const [scenarioId, setScenarioId] = useState("normal");
-  const [speed, setSpeed] = useState(3);
+  const [speed, setSpeed] = useState(2);
   const [running, setRunning] = useState(true);
 
   const { fixed, ai, reset } = useTrafficDuel({ scenarioId, speed, running });
@@ -42,8 +42,8 @@ export default function App() {
       />
 
       <div className="duel-grid">
-        <IntersectionView title="고정 신호 (기존 방식)" state={fixed} />
-        <IntersectionView
+        <Intersection3D title="고정 신호 (기존 방식)" state={fixed} />
+        <Intersection3D
           title="AI 적응형 신호"
           state={ai}
           badge={<span className="badge-ai">AI</span>}
