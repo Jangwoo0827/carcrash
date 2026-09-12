@@ -16,18 +16,24 @@ const MAX_GREEN = 40; // seconds — hard cap so one direction can't hog the lig
 const YELLOW_TIME = 2.5; // seconds
 const HEADWAY_THROUGH = 2.0; // seconds to clear one through car (~1800 veh/hr)
 const HEADWAY_TURN = 2.6; // turning vehicles clear the stop line a bit slower
-// Red side must be this much MORE congested to justify switching early. Kept
-// deliberately high: when both sides are simply oversaturated (heavy but even
-// demand), a low threshold reacts to noise and thrashes between phases —
-// every switch burns YELLOW_TIME with zero throughput, which can make the
-// "smart" controller worse than a boring fixed cycle. Only switch early for a
-// real imbalance, not a queue that's 2-3 cars ahead.
-const GAP_THRESHOLD = 8;
 const LOG_LIMIT = 10;
 const EWMA_TAU = 10; // seconds — smoothing window for the AI's own arrival-rate estimate
 const LOOKAHEAD = 8; // seconds — how far ahead the AI projects queue growth
 const STARVATION_LIMIT = 55; // seconds — nobody should wait longer than this, no matter what
 const THOUGHT_INTERVAL = 6; // seconds between "still thinking" log entries while holding a phase
+
+// Mini-MPC: rather than only reacting to the current queue snapshot, actually
+// clone the state and fast-forward it a few seconds under each candidate
+// action, then act on whichever candidate produced less total wait. This is
+// deliberately simple (a single "switch now" vs "keep going" comparison, no
+// recursive re-planning inside the horizon) — a full receding-horizon
+// controller would re-plan every step, but re-evaluating this often would
+// dominate the frame budget at high replay speeds for a benefit that's
+// mostly noise at a 10-15s horizon anyway.
+const PLAN_HORIZON = 24; // seconds simulated forward per candidate
+const PLAN_STEP = 1; // seconds per coarse step inside the projection
+const PLAN_INTERVAL = 4; // seconds between re-evaluating the plan
+const PLAN_MARGIN = 0.85; // switching must beat holding by at least ~15% to act (avoids noise-driven flapping)
 
 const CROSS_DURATION = { through: 1.8, left: 2.6, right: 2.2, uturn: 3.0 };
 // Movement mix for newly-arriving traffic on any approach.
@@ -81,6 +87,7 @@ export function createSimState(seed) {
     arrivalEwma: { N: 0, S: 0, E: 0, W: 0 },
     confidence: 50,
     lastThoughtAt: -THOUGHT_INTERVAL,
+    lastPlanAt: -PLAN_INTERVAL,
     queueSnapshot: { N: 0, S: 0, E: 0, W: 0 },
     stats: {
       departed: { N: 0, S: 0, E: 0, W: 0 },
@@ -156,7 +163,7 @@ function computeConfidence(greenQueue, redQueue) {
   return Math.max(8, Math.min(97, Math.round(50 + Math.abs(redQueue - greenQueue) * 6)));
 }
 
-function logThought(state, greenQueue, redQueue) {
+function logThought(state, greenQueue, redQueue, plan) {
   if (state.time - state.lastThoughtAt < THOUGHT_INTERVAL) return;
   state.lastThoughtAt = state.time;
 
@@ -169,26 +176,90 @@ function logThought(state, greenQueue, redQueue) {
   const redTrend = red
     .map((a) => `${APPROACH_LABEL[a]}${approachQueueLength(state, a)}대${trendArrow(approachQueueLength(state, a), prev[a])}`)
     .join(" ");
-  const redForecast = red.reduce((s, a) => s + forecastQueueLength(state, a, LOOKAHEAD), 0);
+  const redForecast = plan ? plan.redForecast : red.reduce((s, a) => s + forecastQueueLength(state, a, LOOKAHEAD), 0);
   const inflowPct = redQueue > 0 ? Math.round(((redForecast - redQueue) / redQueue) * 100) : redForecast > 0 ? 100 : 0;
+  const planNote = plan
+    ? ` · 가상실행: 유지 ${plan.costHold.toFixed(0)} vs 전환 ${plan.costSwitch.toFixed(0)}`
+    : "";
 
   for (const a of APPROACHES) state.queueSnapshot[a] = approachQueueLength(state, a);
 
   pushLog(
     state,
-    `[${PHASE_LABEL[state.phase]} 진행 ${Math.floor(state.phaseElapsed)}s] 현재측 ${greenTrend} · 반대측 ${redTrend} (${LOOKAHEAD}초 후 예상 유입 ${inflowPct >= 0 ? "+" : ""}${inflowPct}%) · 확신도 ${state.confidence}% → 유지`,
+    `[${PHASE_LABEL[state.phase]} 진행 ${Math.floor(state.phaseElapsed)}s] 현재측 ${greenTrend} · 반대측 ${redTrend} (${LOOKAHEAD}초 후 예상 유입 ${inflowPct >= 0 ? "+" : ""}${inflowPct}%)${planNote} · 확신도 ${state.confidence}% → 유지`,
     "thought"
   );
+}
+
+/**
+ * Projects `PLAN_HORIZON` seconds forward under one candidate action —
+ * switching phase right now, or holding — and returns a cost (lower is
+ * better; the time-integral of queue length, i.e. total vehicle-seconds of
+ * delay, the standard traffic-engineering way to score a queueing outcome).
+ *
+ * This is a deterministic *fluid* model — queues are tracked as continuous
+ * numbers (arrival rate in, service rate out while green) rather than by
+ * cloning the real state and re-running the discrete, randomized car-by-car
+ * simulation. An earlier version did exactly that (clone + replay with an
+ * independent RNG), and it was a real bug: over a short horizon at light
+ * traffic, a handful of cars arriving in one candidate's random draw but not
+ * the other's is pure noise, not signal — the AI ended up "planning" based on
+ * which side happened to get lucky arrivals in that one sample, not which
+ * decision actually helps. The fluid model feeds both candidates the exact
+ * same continuous arrival rate and differs only in which side is served when,
+ * which is the only thing this decision actually controls.
+ */
+function projectCost(state, arrivalRates, switchNow) {
+  let phase = state.phase;
+  let phaseElapsed = state.phaseElapsed;
+  let yellow = state.yellow;
+  let yellowElapsed = state.yellowElapsed;
+  if (switchNow && !yellow) {
+    yellow = true;
+    yellowElapsed = 0;
+  }
+
+  const queue = {};
+  for (const a of APPROACHES) queue[a] = approachQueueLength(state, a);
+  const arrivalRate = (a) => (arrivalRates[a] ?? 0) / 60; // cars/sec
+  const serviceRate = 1 / HEADWAY_THROUGH; // cars/sec cleared while green
+
+  let cost = 0;
+  for (let t = 0; t < PLAN_HORIZON; t += PLAN_STEP) {
+    if (yellow) {
+      yellowElapsed += PLAN_STEP;
+      if (yellowElapsed >= YELLOW_TIME) {
+        yellow = false;
+        yellowElapsed = 0;
+        phase = otherPhase(phase);
+        phaseElapsed = 0;
+      }
+    } else {
+      phaseElapsed += PLAN_STEP;
+    }
+    const greenSet = yellow ? [] : PHASES[phase];
+    for (const a of APPROACHES) {
+      queue[a] = Math.max(0, queue[a] + arrivalRate(a) * PLAN_STEP);
+      if (greenSet.includes(a)) {
+        queue[a] = Math.max(0, queue[a] - serviceRate * PLAN_STEP);
+      }
+      // Area under the queue-length curve ~ total vehicle-seconds of delay.
+      cost += queue[a] * PLAN_STEP;
+    }
+  }
+  return cost;
 }
 
 /**
  * Adaptive controller: gap-out / max-out actuated control, the same principle
  * real "smart" signal controllers use — extend green while it's still being
  * used, cut it short once the queue clears, and never starve the other side.
- * Layered on top: an EWMA arrival-rate forecast, a confidence estimate, and a
- * hard fairness backstop so no single vehicle waits forever.
+ * Layered on top: an EWMA arrival-rate forecast, a confidence estimate, a
+ * hard fairness backstop so no single vehicle waits forever, and — for the
+ * "is this actually worth switching for" judgment call — a mini-MPC that
+ * simulates both options forward instead of guessing from a static threshold.
  */
-export function adaptiveController(state) {
+export function adaptiveController(state, dt, arrivalRates) {
   const green = PHASES[state.phase];
   const red = PHASES[otherPhase(state.phase)];
   const greenQueue = green.reduce((s, a) => s + approachQueueLength(state, a), 0);
@@ -214,13 +285,27 @@ export function adaptiveController(state) {
     return `${PHASE_LABEL[state.phase]} 방향 대기 차량 없음 → 조기 전환`;
   }
 
+  if (!arrivalRates || state.time - state.lastPlanAt < PLAN_INTERVAL) {
+    logThought(state, greenQueue, redQueue);
+    return null;
+  }
+  state.lastPlanAt = state.time;
+
+  const costHold = projectCost(state, arrivalRates, false);
+  const costSwitch = projectCost(state, arrivalRates, true);
   const redForecast = red.reduce((s, a) => s + forecastQueueLength(state, a, LOOKAHEAD), 0);
-  const forecastGap = redForecast - greenQueue;
-  if (redQueue - greenQueue >= GAP_THRESHOLD || forecastGap >= GAP_THRESHOLD + 4) {
-    return `반대편 대기 ${redQueue}대(${LOOKAHEAD}초 후 약 ${Math.round(redForecast)}대 예상) vs 현재 ${greenQueue}대 · 확신도 ${state.confidence}% → ${PHASE_LABEL[otherPhase(state.phase)]}로 전환`;
+
+  if (costSwitch < costHold * PLAN_MARGIN) {
+    const improvementPct = costHold > 0 ? Math.round((1 - costSwitch / costHold) * 100) : 0;
+    state.confidence = Math.max(60, Math.min(97, 60 + improvementPct));
+    return (
+      `🔮 가상 실행(${PLAN_HORIZON}초 앞): 지금 전환하면 대기비용 ${costSwitch.toFixed(0)}, ` +
+      `유지하면 ${costHold.toFixed(0)} (${improvementPct}% 개선 예상) · 반대편 ${redQueue}대 vs 현재 ${greenQueue}대 ` +
+      `→ ${PHASE_LABEL[otherPhase(state.phase)]}로 전환`
+    );
   }
 
-  logThought(state, greenQueue, redQueue);
+  logThought(state, greenQueue, redQueue, { costHold, costSwitch, redForecast });
   return null;
 }
 
@@ -279,7 +364,7 @@ export function stepSimulation(state, dt, { arrivalRates, controller }) {
     }
   } else {
     state.phaseElapsed += dt;
-    const decision = controller(state, dt);
+    const decision = controller(state, dt, arrivalRates);
     if (decision) switchPhase(state, typeof decision === "string" ? decision : null);
   }
 
