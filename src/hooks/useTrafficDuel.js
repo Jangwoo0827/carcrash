@@ -13,8 +13,8 @@ import { SCENARIOS } from "../utils/scenarios";
 // freezing the sim in one giant burst the moment the tab regains focus.
 const MAX_FRAME_DT = 5;
 const SUB_STEP = 0.08; // seconds per simulation sub-step, keeps the controllers stable at high speed
-const RENDER_HZ = 15; // how often we push a re-render (the sim itself still steps every tick)
-const TICK_MS = 50; // setInterval, not requestAnimationFrame — keeps firing in background tabs
+const RENDER_HZ = 30; // how often we push a re-render (the sim itself still steps every tick)
+const TICK_MS = 33; // setInterval, not requestAnimationFrame — keeps firing in background tabs
 const HISTORY_SAMPLE_INTERVAL = 3; // sim-seconds between comparison-chart samples
 const HISTORY_MAX_POINTS = 240;
 

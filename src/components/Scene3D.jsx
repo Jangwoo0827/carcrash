@@ -55,7 +55,9 @@ function QueuedVehicles({ state }) {
       const queue = state.queues[approach][lane];
       const shown = Math.min(queue.length, MAX_QUEUE_SHOWN);
       for (let i = 0; i < shown; i++) {
-        const back = (i + 1) * QUEUE_SPACING;
+        // i=0 sits exactly on the stop line (matches the crossing path's own
+        // t=0 point) so departing doesn't visibly snap the car forward.
+        const back = i * QUEUE_SPACING;
         const p = { x: base.x - a.dir.x * back, y: base.y - a.dir.y * back };
         items.push(
           <GltfModel

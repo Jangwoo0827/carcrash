@@ -73,13 +73,20 @@ function centerLanePoint(approach, offsetKind) {
   return add(CENTER, a[offsetKind]);
 }
 
-/** Quadratic bezier sample: point + tangent angle (radians) at t in [0,1]. */
-function quadBezier(p0, p1, p2, t) {
+/**
+ * Cubic bezier sample: point + tangent angle (radians) at t in [0,1].
+ * Unlike a single-control-point quadratic, a cubic's end tangents are set
+ * directly by (p1-p0) and (p3-p2) — so building it from real travel
+ * directions (see buildPath) guarantees the curve enters and leaves facing
+ * the right way, regardless of where the lane offsets happen to place the
+ * endpoints relative to each other.
+ */
+function cubicBezier(p0, p1, p2, p3, t) {
   const mt = 1 - t;
-  const x = mt * mt * p0.x + 2 * mt * t * p1.x + t * t * p2.x;
-  const y = mt * mt * p0.y + 2 * mt * t * p1.y + t * t * p2.y;
-  const dx = 2 * mt * (p1.x - p0.x) + 2 * t * (p2.x - p1.x);
-  const dy = 2 * mt * (p1.y - p0.y) + 2 * t * (p2.y - p1.y);
+  const x = mt * mt * mt * p0.x + 3 * mt * mt * t * p1.x + 3 * mt * t * t * p2.x + t * t * t * p3.x;
+  const y = mt * mt * mt * p0.y + 3 * mt * mt * t * p1.y + 3 * mt * t * t * p2.y + t * t * t * p3.y;
+  const dx = 3 * mt * mt * (p1.x - p0.x) + 6 * mt * t * (p2.x - p1.x) + 3 * t * t * (p3.x - p2.x);
+  const dy = 3 * mt * mt * (p1.y - p0.y) + 6 * mt * t * (p2.y - p1.y) + 3 * t * t * (p3.y - p2.y);
   return { x, y, angle: Math.atan2(dy, dx) };
 }
 
@@ -103,54 +110,92 @@ export function buildPath(approach, movement) {
   const enterCenter = add(CENTER, inboundLaneOffset(approach, lane));
 
   if (movement === "uturn") {
-    // Tight loop: curve into the median and back out the same arm's outbound lane.
+    // A loop that leaves heading `dir` and returns heading `-dir`. Control
+    // points are placed by pushing straight out from each endpoint along its
+    // own real travel direction, so the tangent at both ends is exact by
+    // construction — no dependence on where the lane offsets land the points.
     const exitStart = centerLanePoint(approach, "outboundOffset");
     const end = exitEdgePoint(approach);
-    const loopOut = add(enterCenter, scale(from.dir, 14));
-    const control1 = add(loopOut, scale({ x: -from.dir.y, y: from.dir.x }, 22));
-    const control2 = add(exitStart, scale({ x: -from.dir.y, y: from.dir.x }, 22));
+    const handle = 24;
+    const c1 = add(enterCenter, scale(from.dir, handle));
+    const c2 = add(exitStart, scale(from.dir, handle)); // exit direction is -from.dir
     return {
       kind: "uturn",
       sample(t) {
-        if (t < 0.5) return quadBezier(start, loopOut, control1, t / 0.5);
-        if (t < 0.85) return quadBezier(control1, control2, exitStart, (t - 0.5) / 0.35);
-        return lerpPoint(exitStart, end, (t - 0.85) / 0.15);
+        if (t < 0.1) return lerpPoint(start, enterCenter, t / 0.1);
+        if (t < 0.75) return cubicBezier(enterCenter, c1, c2, exitStart, (t - 0.1) / 0.65);
+        return lerpPoint(exitStart, end, (t - 0.75) / 0.25);
       },
     };
   }
 
   const targetApproach = MOVEMENT_TARGET[approach][movement];
-  const end = exitEdgePoint(targetApproach);
-  const exitLane = centerLanePoint(targetApproach, "outboundOffset");
 
   if (movement === "through") {
+    // Opposite approaches share the same lane offset by construction (see
+    // the APPROACH table above), so `enterCenter` and the equivalent point on
+    // the exit lane are literally the same coordinate — a "start -> center ->
+    // end" path used to lerp into that shared point and sit there (zero
+    // velocity) for the whole middle 60% of the crossing. It's just one
+    // straight line the entire way; sample it as one.
     return {
       kind: "through",
       sample(t) {
-        if (t < 0.2) return lerpPoint(start, enterCenter, t / 0.2);
-        if (t < 0.8) return lerpPoint(enterCenter, exitLane, (t - 0.2) / 0.6);
-        return lerpPoint(exitLane, end, (t - 0.8) / 0.2);
+        return lerpPoint(start, exitEdgePoint(targetApproach), t);
       },
     };
   }
 
-  // Left/right turns always cross from a vertical-axis approach (N/S) to a
-  // horizontal-axis one (E/W) or vice versa. The "L-corner" — where the
-  // entry's tangent line meets the exit's tangent line — is the single
-  // quadratic-bezier control point that makes a smooth quarter-circle-ish arc.
-  const enterIsVertical = approach === "N" || approach === "S";
-  const turnControl = enterIsVertical
-    ? { x: enterCenter.x, y: exitLane.y }
-    : { x: exitLane.x, y: enterCenter.y };
+  // Left/right turns as a true circular arc. A cubic bezier tied to the raw
+  // entry/exit coordinates could overshoot and loop back on itself whenever a
+  // wider lane offset (e.g. the outboard right-turn lane) shifted the points
+  // out of the "nice" arrangement — a circle can't do that: pick a center R
+  // to the turning side of the car, and the 90-degree arc between the two
+  // perpendicular tangent lines is smooth by definition, no matter where the
+  // lane offsets place the endpoints.
+  // Rotate the entry radius vector by exactly +/-90deg (never independently
+  // re-derived from the exit direction) so the exit tangent is *guaranteed*
+  // perpendicular to the entry tangent — i.e. always exactly matches exitDir,
+  // since any turn is by definition a 90-degree change of direction.
+  const turnSide = movement === "right" ? rightPerp(from.dir) : leftPerp(from.dir);
+  const sweep = movement === "right" ? Math.PI / 2 : -Math.PI / 2;
+  const radius = 22;
+  const arcCenter = add(enterCenter, scale(turnSide, radius));
+  const theta1 = Math.atan2(enterCenter.y - arcCenter.y, enterCenter.x - arcCenter.x);
+  const theta2 = theta1 + sweep;
+  const arcExit = { x: arcCenter.x + radius * Math.cos(theta2), y: arcCenter.y + radius * Math.sin(theta2) };
+  const exitTangentAngle = theta2 + (sweep >= 0 ? Math.PI / 2 : -Math.PI / 2);
+  // Continue straight out from arcExit along its own exact tangent, rather
+  // than aiming at the independently-computed edge point — the edge point
+  // sits on the lane's true centerline while arcExit is offset from it by
+  // whatever the lane spread happens to be, so aiming at it would reintroduce
+  // a (smaller, but still visible) kink right where the arc ends.
+  const exitDirExact = { x: Math.cos(exitTangentAngle), y: Math.sin(exitTangentAngle) };
+  const farExit = add(arcExit, scale(exitDirExact, ARM * 2));
 
   return {
     kind: movement,
     sample(t) {
-      if (t < 0.15) return lerpPoint(start, enterCenter, t / 0.15);
-      if (t < 0.75) return quadBezier(enterCenter, turnControl, exitLane, (t - 0.15) / 0.6);
-      return lerpPoint(exitLane, end, (t - 0.75) / 0.25);
+      if (t < 0.1) return lerpPoint(start, enterCenter, t / 0.1);
+      if (t < 0.8) {
+        const u = (t - 0.1) / 0.7;
+        const theta = theta1 + sweep * u;
+        return {
+          x: arcCenter.x + radius * Math.cos(theta),
+          y: arcCenter.y + radius * Math.sin(theta),
+          angle: theta + (sweep >= 0 ? Math.PI / 2 : -Math.PI / 2),
+        };
+      }
+      return lerpPoint(arcExit, farExit, (t - 0.8) / 0.2);
     },
   };
+}
+
+function rightPerp(d) {
+  return { x: -d.y, y: d.x };
+}
+function leftPerp(d) {
+  return { x: d.y, y: -d.x };
 }
 
 /** Crosswalk geometry: a short strip just outside the intersection box on each arm. */

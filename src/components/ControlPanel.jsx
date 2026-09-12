@@ -1,7 +1,7 @@
 import { SCENARIO_LIST } from "../utils/scenarios";
 
-const SPEED_PRESETS = [1, 2, 4, 8, 16, 32, 64];
-const MAX_SPEED = 64;
+const SPEED_PRESETS = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+const MAX_SPEED = 256;
 
 export default function ControlPanel({
   scenarioId,
