@@ -1,4 +1,6 @@
-import Scene3D, { PhaseChip } from "./Scene3D";
+import Scene3D from "./Scene3D";
+import Scene2D from "./Scene2D";
+import PhaseChip from "./PhaseChip";
 import ApproachHud from "./ApproachHud";
 
 export default function IntersectionPanel({ title, badge, state, viewMode, onExpand }) {
@@ -13,7 +15,7 @@ export default function IntersectionPanel({ title, badge, state, viewMode, onExp
         </button>
       </div>
       <div className="canvas-wrap">
-        <Scene3D state={state} viewMode={viewMode} />
+        {viewMode === "3d" ? <Scene3D state={state} /> : <Scene2D state={state} />}
         <ApproachHud state={state} />
       </div>
     </div>

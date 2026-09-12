@@ -1,6 +1,6 @@
 import { Suspense, useMemo } from "react";
 import { Canvas } from "@react-three/fiber";
-import { OrbitControls, OrthographicCamera, PerspectiveCamera, useGLTF } from "@react-three/drei";
+import { OrbitControls, PerspectiveCamera, useGLTF } from "@react-three/drei";
 import {
   APPROACH,
   APPROACHES,
@@ -11,7 +11,7 @@ import {
   laneCategory,
   stopPoint,
 } from "../utils/geometry";
-import { crosswalkWalkable, lightStateFor, PHASE_LABEL } from "../utils/trafficSim";
+import { crosswalkWalkable, lightStateFor } from "../utils/trafficSim";
 import { ALL_MODEL_URLS, MODEL_URLS } from "../three/assets";
 
 for (const url of ALL_MODEL_URLS) useGLTF.preload(url);
@@ -167,36 +167,20 @@ function Ground() {
   );
 }
 
-function CameraRig({ viewMode }) {
-  return (
-    <>
-      <PerspectiveCamera makeDefault={viewMode === "3d"} position={[16, 17, 19]} fov={42} />
-      <OrthographicCamera
-        makeDefault={viewMode === "2d"}
-        position={[0, 30, 0.01]}
-        rotation={[-Math.PI / 2, 0, 0]}
-        zoom={9}
-      />
-      {viewMode === "3d" ? (
-        <OrbitControls
-          enablePan={false}
-          minDistance={10}
-          maxDistance={42}
-          minPolarAngle={0.15}
-          maxPolarAngle={Math.PI / 2 - 0.05}
-        />
-      ) : null}
-    </>
-  );
-}
-
-export default function Scene3D({ state, viewMode }) {
+export default function Scene3D({ state }) {
   return (
     <Canvas shadows dpr={[1, 1.5]} frameloop="always">
       <color attach="background" args={["#0c0d10"]} />
       <ambientLight intensity={0.7} />
       <directionalLight position={[8, 12, 6]} intensity={1.1} castShadow />
-      <CameraRig viewMode={viewMode} />
+      <PerspectiveCamera makeDefault position={[16, 17, 19]} fov={42} />
+      <OrbitControls
+        enablePan={false}
+        minDistance={10}
+        maxDistance={42}
+        minPolarAngle={0.15}
+        maxPolarAngle={Math.PI / 2 - 0.05}
+      />
       <Suspense fallback={null}>
         <Ground />
         <Crosswalks state={state} />
@@ -206,13 +190,5 @@ export default function Scene3D({ state, viewMode }) {
         <TrafficLights state={state} />
       </Suspense>
     </Canvas>
-  );
-}
-
-export function PhaseChip({ state }) {
-  return (
-    <span className="phase-chip">
-      {PHASE_LABEL[state.phase]} {state.yellow ? "전환중" : `${Math.floor(state.phaseElapsed)}s`}
-    </span>
   );
 }

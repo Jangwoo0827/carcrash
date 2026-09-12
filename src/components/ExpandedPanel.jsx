@@ -1,5 +1,7 @@
 import { useEffect } from "react";
-import Scene3D, { PhaseChip } from "./Scene3D";
+import Scene3D from "./Scene3D";
+import Scene2D from "./Scene2D";
+import PhaseChip from "./PhaseChip";
 import ApproachHud from "./ApproachHud";
 
 export default function ExpandedPanel({ title, badge, state, viewMode, onViewModeChange, onClose }) {
@@ -27,7 +29,7 @@ export default function ExpandedPanel({ title, badge, state, viewMode, onViewMod
         </div>
       </div>
       <div className="expanded-canvas-wrap">
-        <Scene3D state={state} viewMode={viewMode} />
+        {viewMode === "3d" ? <Scene3D state={state} /> : <Scene2D state={state} />}
         <ApproachHud state={state} />
       </div>
     </div>

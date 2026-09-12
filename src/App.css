@@ -255,7 +255,8 @@
   background: #0c0d10;
 }
 
-.expanded-canvas-wrap canvas {
+.expanded-canvas-wrap canvas,
+.expanded-canvas-wrap .scene-2d {
   display: block;
   touch-action: none;
 }
@@ -269,9 +270,15 @@
   background: #0c0d10;
 }
 
-.canvas-wrap canvas {
+.canvas-wrap canvas,
+.canvas-wrap .scene-2d {
   display: block;
   touch-action: none;
+}
+
+.scene-2d {
+  width: 100%;
+  height: 100%;
 }
 
 /* Per-approach HUD: car/pedestrian counts + light color, laid out at the
