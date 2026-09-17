@@ -44,6 +44,21 @@ const PLAN_STEP = 1; // seconds per coarse step inside the projection
 const PLAN_INTERVAL = 4; // seconds between re-evaluating the plan
 const PLAN_MARGIN = 0.75; // switching must beat holding by at least ~25% to act (avoids noise-driven flapping)
 
+// Protected left-turn ("lead-left"): permissive lefts yield to oncoming
+// through/right traffic, and under heavy opposing flow that gap basically
+// never opens — measured queue length in the rush scenario averaged ~24
+// left-turners backed up vs ~5-6 through, which is a real bottleneck, not a
+// tuning artifact. A lead-left window at the start of a phase stops both
+// approaches' through/right traffic and lets both approaches' lefts go
+// unimpeded, the same fix real signal engineers reach for. Fixed timing gets
+// a naive flat-duration version (still "dumb", just not starved); the
+// adaptive controller only spends time on it when the left queue actually
+// justifies it.
+const LEAD_LEFT_HEADWAY = 2.2; // seconds per protected-left departure — faster than HEADWAY_TURN since there's no gap-hunting
+const LEAD_LEFT_MAX = 20; // seconds — cap so a huge left backlog can't starve the through movement entirely
+const ADAPTIVE_LEAD_LEFT_THRESHOLD = 3; // vehicles — below this, permissive lefts clear fine on their own, not worth the overhead
+const FIXED_LEAD_LEFT_DURATION = 8; // seconds — flat window, no queue awareness (matches "fixed timing" philosophy)
+
 const CROSS_DURATION = { through: 1.8, left: 2.6, right: 2.2, uturn: 3.0 };
 // Movement mix for newly-arriving traffic on any approach.
 const MOVEMENT_WEIGHTS = [
@@ -94,6 +109,22 @@ function dynamicMaxGreen(arrivalRates, redApproaches) {
   return MAX_GREEN_CEIL - (MAX_GREEN_CEIL - MAX_GREEN_FLOOR) * redLoad;
 }
 
+function groupLeftQueue(state, group) {
+  return group.reduce((s, a) => s + state.queues[a].left.length, 0);
+}
+
+/** Dumb fixed-timing policy: always spend a flat window on lefts if any are waiting. */
+export function fixedLeadLeftPolicy(state) {
+  return groupLeftQueue(state, PHASES[state.phase]) > 0 ? FIXED_LEAD_LEFT_DURATION : 0;
+}
+
+/** Smart policy: only spend time on it once the backlog actually justifies the overhead. */
+export function adaptiveLeadLeftPolicy(state) {
+  const q = groupLeftQueue(state, PHASES[state.phase]);
+  if (q < ADAPTIVE_LEAD_LEFT_THRESHOLD) return 0;
+  return Math.min(LEAD_LEFT_MAX, q * LEAD_LEFT_HEADWAY);
+}
+
 function pickMovement(rng) {
   const r = rng();
   let acc = 0;
@@ -119,6 +150,9 @@ export function createSimState(seed) {
     phaseElapsed: 0,
     yellow: false,
     yellowElapsed: 0,
+    leadLeft: false,
+    leadLeftElapsed: 0,
+    leadLeftPlanned: 0,
     lastSwitchReason: null,
     arrivalEwma: { N: 0, S: 0, E: 0, W: 0 },
     confidence: 50,
@@ -372,7 +406,7 @@ function departVehicle(state, approach, lane) {
   });
 }
 
-export function stepSimulation(state, dt, { arrivalRates, controller }) {
+export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPolicy }) {
   state.time += dt;
 
   // 1. Vehicle arrivals — also feeds the AI's own EWMA estimate of arrival
@@ -392,13 +426,23 @@ export function stepSimulation(state, dt, { arrivalRates, controller }) {
     }
   }
 
-  // 2. Signal phase / yellow transition
+  // 2. Signal phase / yellow / lead-left transition
   if (state.yellow) {
     state.yellowElapsed += dt;
     if (state.yellowElapsed >= YELLOW_TIME) {
       state.yellow = false;
       state.yellowElapsed = 0;
       state.phase = otherPhase(state.phase);
+      state.phaseElapsed = 0;
+      const duration = leadLeftPolicy ? leadLeftPolicy(state, arrivalRates) : 0;
+      state.leadLeft = duration > 0;
+      state.leadLeftElapsed = 0;
+      state.leadLeftPlanned = duration;
+    }
+  } else if (state.leadLeft) {
+    state.leadLeftElapsed += dt;
+    if (state.leadLeftElapsed >= state.leadLeftPlanned || groupLeftQueue(state, PHASES[state.phase]) === 0) {
+      state.leadLeft = false;
       state.phaseElapsed = 0;
     }
   } else {
@@ -407,9 +451,12 @@ export function stepSimulation(state, dt, { arrivalRates, controller }) {
     if (decision) switchPhase(state, typeof decision === "string" ? decision : null);
   }
 
-  // 3. Through-lane departures (only while this approach's phase is green)
+  // 3. Through-lane departures (only while this approach's phase is green,
+  // and paused during a lead-left window since the whole point of that
+  // window is to hold both approaches' through traffic so their lefts can
+  // cross unimpeded).
   for (const a of APPROACHES) {
-    const isGreen = !state.yellow && PHASES[state.phase].includes(a);
+    const isGreen = !state.yellow && !state.leadLeft && PHASES[state.phase].includes(a);
     if (!isGreen) {
       state.serviceTimer[a].through = 0;
       continue;
@@ -422,16 +469,32 @@ export function stepSimulation(state, dt, { arrivalRates, controller }) {
     if (state.queues[a].through.length === 0) state.serviceTimer[a].through = 0;
   }
 
-  // 4. Left-lane departures: gated by the same green, but only when the
+  // 4. Left-lane departures. During a lead-left window both approaches'
+  // opposing through/right traffic is held (see step 3), so lefts run
+  // unimpeded at their own (faster) headway. Outside that window, lefts fall
+  // back to permissive behavior: gated by the same green, but only when the
   // opposing approach isn't currently sending a car through the box (a rough
   // stand-in for "yield to oncoming traffic, take the gap when it appears").
   for (const a of APPROACHES) {
-    const isGreen = !state.yellow && PHASES[state.phase].includes(a);
+    const inGroup = !state.yellow && PHASES[state.phase].includes(a);
+    if (!inGroup) {
+      state.serviceTimer[a].left = 0;
+      continue;
+    }
+    if (state.leadLeft) {
+      state.serviceTimer[a].left += dt;
+      while (state.serviceTimer[a].left >= LEAD_LEFT_HEADWAY && state.queues[a].left.length > 0) {
+        state.serviceTimer[a].left -= LEAD_LEFT_HEADWAY;
+        departVehicle(state, a, "left");
+      }
+      if (state.queues[a].left.length === 0) state.serviceTimer[a].left = 0;
+      continue;
+    }
     const opp = oppositeApproach(a);
     const oppOccupied = state.crossing.some(
       (v) => v.approach === opp && (v.movement === "through" || v.movement === "right")
     );
-    if (!isGreen || oppOccupied) {
+    if (oppOccupied) {
       state.serviceTimer[a].left = 0;
       continue;
     }

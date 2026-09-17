@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   adaptiveController,
+  adaptiveLeadLeftPolicy,
   averageWait,
   createSimState,
   fixedController,
+  fixedLeadLeftPolicy,
   stepSimulation,
 } from "../utils/trafficSim";
 import { SCENARIOS } from "../utils/scenarios";
@@ -51,8 +53,16 @@ export function useTrafficDuel({ scenarioId, speed, running }) {
         const subDt = scaledDt / steps;
         const rates = SCENARIOS[scenarioId].rates;
         for (let i = 0; i < steps; i++) {
-          stepSimulation(fixedRef.current, subDt, { arrivalRates: rates, controller: fixedController });
-          stepSimulation(aiRef.current, subDt, { arrivalRates: rates, controller: adaptiveController });
+          stepSimulation(fixedRef.current, subDt, {
+            arrivalRates: rates,
+            controller: fixedController,
+            leadLeftPolicy: fixedLeadLeftPolicy,
+          });
+          stepSimulation(aiRef.current, subDt, {
+            arrivalRates: rates,
+            controller: adaptiveController,
+            leadLeftPolicy: adaptiveLeadLeftPolicy,
+          });
         }
 
         if (aiRef.current.time - lastSampleRef.current >= HISTORY_SAMPLE_INTERVAL) {
