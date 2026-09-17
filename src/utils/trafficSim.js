@@ -56,7 +56,7 @@ const PLAN_MARGIN = 0.75; // switching must beat holding by at least ~25% to act
 // justifies it.
 const LEAD_LEFT_HEADWAY = 2.2; // seconds per protected-left departure — faster than HEADWAY_TURN since there's no gap-hunting
 const LEAD_LEFT_MAX = 20; // seconds — cap so a huge left backlog can't starve the through movement entirely
-const ADAPTIVE_LEAD_LEFT_THRESHOLD = 3; // vehicles — below this, permissive lefts clear fine on their own, not worth the overhead
+const ADAPTIVE_LEAD_LEFT_THRESHOLD = 2; // vehicles — below this, permissive lefts clear fine on their own, not worth the overhead
 const FIXED_LEAD_LEFT_DURATION = 8; // seconds — flat window, no queue awareness (matches "fixed timing" philosophy)
 
 const CROSS_DURATION = { through: 1.8, left: 2.6, right: 2.2, uturn: 3.0 };
