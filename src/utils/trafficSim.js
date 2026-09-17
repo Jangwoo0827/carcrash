@@ -11,8 +11,17 @@ export const PHASES = {
 export const APPROACH_LABEL = { N: "북", S: "남", E: "동", W: "서" };
 export const PHASE_LABEL = { NS: "남북", EW: "동서" };
 
-const MIN_GREEN = 10; // seconds — every phase gets at least this much, no starvation
-const MAX_GREEN = 40; // seconds — hard cap so one direction can't hog the light
+const MIN_GREEN = 10; // seconds — fallback when arrival rates aren't available yet
+const MAX_GREEN = 40; // seconds — fallback hard cap so one direction can't hog the light
+// MIN_GREEN's floor stays at the original baseline (10s) — dropping it under
+// light load caused a real regression during testing: gap-out fires the
+// moment the queue hits zero, so a low minimum just makes the signal
+// ping-pong every ~6-8s, and each switch burns YELLOW_TIME with almost
+// nothing to show for it. Only the ceiling scales up under heavy demand.
+const MIN_GREEN_FLOOR = 10; // seconds — baseline min-green, light demand
+const MIN_GREEN_CEIL = 16; // seconds — longest min-green, under heavy green-side demand
+const MAX_GREEN_FLOOR = 26; // seconds — shortest max-green, used when the red side is under heavy demand
+const MAX_GREEN_CEIL = 60; // seconds — longest max-green, used when the red side is nearly empty
 const YELLOW_TIME = 2.5; // seconds
 const HEADWAY_THROUGH = 2.0; // seconds to clear one through car (~1800 veh/hr)
 const HEADWAY_TURN = 2.6; // turning vehicles clear the stop line a bit slower
@@ -33,7 +42,7 @@ const THOUGHT_INTERVAL = 6; // seconds between "still thinking" log entries whil
 const PLAN_HORIZON = 24; // seconds simulated forward per candidate
 const PLAN_STEP = 1; // seconds per coarse step inside the projection
 const PLAN_INTERVAL = 4; // seconds between re-evaluating the plan
-const PLAN_MARGIN = 0.85; // switching must beat holding by at least ~15% to act (avoids noise-driven flapping)
+const PLAN_MARGIN = 0.75; // switching must beat holding by at least ~25% to act (avoids noise-driven flapping)
 
 const CROSS_DURATION = { through: 1.8, left: 2.6, right: 2.2, uturn: 3.0 };
 // Movement mix for newly-arriving traffic on any approach.
@@ -56,6 +65,33 @@ function otherPhase(phase) {
 
 function oppositeApproach(a) {
   return { N: "S", S: "N", E: "W", W: "E" }[a];
+}
+
+const SAT_FLOW_PER_MIN = 60 / HEADWAY_THROUGH; // one lane's max clearable rate, veh/min
+
+/**
+ * Fixed MIN_GREEN/MAX_GREEN bounds waste time either way: a heavy-demand
+ * green cut off at a low fixed minimum barely gets going before it's
+ * eligible to switch again, while a light-demand green forced to hold the
+ * same minimum sits idle-green for no reason. Scaling both bounds by how
+ * loaded the relevant side actually is (relative to one lane's saturation
+ * flow) lets the signal react fast when traffic is light and hold longer
+ * only when the demand actually justifies it.
+ */
+function dynamicMinGreen(arrivalRates, greenApproaches) {
+  if (!arrivalRates) return MIN_GREEN;
+  const demand = greenApproaches.reduce((s, a) => s + (arrivalRates[a] ?? 0), 0);
+  const load = Math.min(1, demand / SAT_FLOW_PER_MIN);
+  return MIN_GREEN_FLOOR + (MIN_GREEN_CEIL - MIN_GREEN_FLOOR) * load;
+}
+
+function dynamicMaxGreen(arrivalRates, redApproaches) {
+  if (!arrivalRates) return MAX_GREEN;
+  const redDemand = redApproaches.reduce((s, a) => s + (arrivalRates[a] ?? 0), 0);
+  const redLoad = Math.min(1, redDemand / SAT_FLOW_PER_MIN);
+  // Heavier red-side demand => shorter cap (serve it sooner); quiet red side
+  // => longer cap allowed (no point cutting a productive green short).
+  return MAX_GREEN_CEIL - (MAX_GREEN_CEIL - MAX_GREEN_FLOOR) * redLoad;
 }
 
 function pickMovement(rng) {
@@ -274,11 +310,14 @@ export function adaptiveController(state, dt, arrivalRates) {
     return `⚖️ 공정성 개입: ${PHASE_LABEL[otherPhase(state.phase)]} 방향 차량이 ${Math.round(redOldestWait)}초째 대기 → 즉시 전환`;
   }
 
-  if (state.phaseElapsed < MIN_GREEN) return null;
+  const minGreen = dynamicMinGreen(arrivalRates, green);
+  const maxGreen = dynamicMaxGreen(arrivalRates, red);
 
-  if (state.phaseElapsed >= MAX_GREEN) {
+  if (state.phaseElapsed < minGreen) return null;
+
+  if (state.phaseElapsed >= maxGreen) {
     state.confidence = 65;
-    return `${PHASE_LABEL[state.phase]} 방향 최대 녹색시간(${MAX_GREEN}s) 도달 → 전환`;
+    return `${PHASE_LABEL[state.phase]} 방향 최대 녹색시간(${Math.round(maxGreen)}s) 도달 → 전환`;
   }
   if (greenQueue === 0 && redQueue > 0) {
     state.confidence = 95;
