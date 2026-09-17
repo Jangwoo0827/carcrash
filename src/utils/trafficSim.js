@@ -29,6 +29,7 @@ const LOG_LIMIT = 10;
 const EWMA_TAU = 10; // seconds — smoothing window for the AI's own arrival-rate estimate
 const LOOKAHEAD = 8; // seconds — how far ahead the AI projects queue growth
 const STARVATION_LIMIT = 55; // seconds — nobody should wait longer than this, no matter what
+const STARVATION_MIN_SERVE = 6; // seconds — a starvation override still needs this much real green first, or repeated overrides can starve BOTH sides at once (see adaptiveController)
 const THOUGHT_INTERVAL = 6; // seconds between "still thinking" log entries while holding a phase
 
 // Mini-MPC: rather than only reacting to the current queue snapshot, actually
@@ -338,8 +339,18 @@ export function adaptiveController(state, dt, arrivalRates) {
 
   // Fairness backstop: a single starved vehicle overrides everything else,
   // even the minimum-green lockout — extreme, but nobody should wait 55s+.
+  // It still requires STARVATION_MIN_SERVE seconds of actual green first,
+  // though: without that floor, once BOTH sides are simultaneously near the
+  // limit (which heavy congestion can absolutely cause), the override fires
+  // again the instant the *next* phase starts, before it has served a single
+  // car — yellow and lead-left in a loop with ~0 real throughput, which only
+  // pushes both queues (and thus both oldest-waits) further up. This was a
+  // real bug found by running the sim for 2+ hours: the queue spiraled to
+  // 1000+ vehicles from exactly this switch-storm once congestion crossed a
+  // critical mass. A short serve floor breaks the loop by guaranteeing every
+  // switch actually buys some real service before it can be pre-empted again.
   const redOldestWait = Math.max(0, ...red.map((a) => oldestThroughWait(state, a)));
-  if (redOldestWait >= STARVATION_LIMIT) {
+  if (redOldestWait >= STARVATION_LIMIT && state.phaseElapsed >= STARVATION_MIN_SERVE) {
     state.confidence = 99;
     return `⚖️ 공정성 개입: ${PHASE_LABEL[otherPhase(state.phase)]} 방향 차량이 ${Math.round(redOldestWait)}초째 대기 → 즉시 전환`;
   }
