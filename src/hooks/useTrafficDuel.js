@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   adaptiveController,
   adaptiveLeadLeftPolicy,
+  adaptiveScramblePolicy,
   averageWait,
   createSimState,
   fixedController,
@@ -63,6 +64,8 @@ export function useTrafficDuel({ scenarioId, speed, running, pedRate }) {
             arrivalRates: rates,
             controller: adaptiveController,
             leadLeftPolicy: adaptiveLeadLeftPolicy,
+            scramblePolicy: adaptiveScramblePolicy,
+            smartPedWalk: true,
             pedRate,
           });
         }

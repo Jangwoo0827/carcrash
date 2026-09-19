@@ -74,11 +74,22 @@ export const DEFAULT_PED_RATE = 7; // pedestrians/min per crosswalk (user-adjust
 const PED_DURATION = 3.2; // seconds to cross
 const PED_RELEASE_INTERVAL = 0.25; // seconds between waiting pedestrians stepping off the curb (a crowd crosses together)
 const PED_COST_CAP = 20; // waiting pedestrians beyond this stop adding cost (a crowd crosses together, so it does not scale linearly)
-const PED_CROWD = 10; // waiting pedestrians on a leg that count as a crowd worth shortening lead-left for
+const PED_CROWD = 5; // waiting pedestrians on a leg that count as a crowd worth shortening lead-left for
 const PED_CROWD_LEAD_LEFT = 6; // seconds — the adaptive lead-left cap while a crowd is waiting
-const PED_WEIGHT = 1.5; // one waiting pedestrian counts like this many waiting cars in the AI's cost
+const PED_IDLE_GREEN_QUEUE = 0; // cars — at or below this, an idle green yields to waiting pedestrians
+const PED_WEIGHT = 1;
+
+// Pedestrian scramble: every vehicle signal red, every crosswalk walkable.
+// Without it a leg's pedestrians only walk during the perpendicular phase,
+// so each crowd waits through a whole other phase (plus lead-left). The
+// adaptive controller inserts one only when enough people are stuck behind
+// the coming phase; fixed timing never does.
+const SCRAMBLE_MIN_WAITING = 14; // pedestrians stuck on the legs the coming phase blocks
+const SCRAMBLE_WAIT = 35; // seconds — or the oldest of them has waited this long
+const SCRAMBLE_COOLDOWN = 90; // seconds between scrambles, so they cannot thrash
+const SCRAMBLE_MAX = 14; // seconds // one waiting pedestrian counts like this many waiting cars in the AI's cost
 const PED_MIN_GREEN = 9; // seconds — a phase serving waiting pedestrians keeps green at least this long
-const PED_MAX_NEEDED = 26; // seconds — cap on green held just to drain a big crowd
+const PED_MAX_NEEDED = 14; // seconds — cap on green held just to drain a big crowd
 const PED_STARVATION_LIMIT = 40; // seconds — pedestrians shouldn't wait longer than this either
 
 export const FIXED_GREEN = 15; // baseline fixed-time cycle half-length
@@ -151,6 +162,17 @@ function oldestPedWait(state, legs) {
   return oldest;
 }
 
+/** Smart policy: call a pedestrian scramble when a crowd is stuck behind the coming phase. */
+export function adaptiveScramblePolicy(state) {
+  if (state.time - state.lastScrambleEnd < SCRAMBLE_COOLDOWN) return 0;
+  const blocked = walkLegs(otherPhase(state.phase));
+  const waiting = pedsWaitingOn(state, blocked);
+  const oldest = oldestPedWait(state, blocked);
+  if (waiting < SCRAMBLE_MIN_WAITING && oldest < SCRAMBLE_WAIT) return 0;
+  const waitingMax = Math.max(...APPROACHES.map((l) => state.pedWaiting[l].length));
+  return Math.min(SCRAMBLE_MAX, PED_DURATION + 2 + waitingMax * PED_RELEASE_INTERVAL);
+}
+
 /** Dumb fixed-timing policy: always spend a flat window on lefts if any are waiting. */
 export function fixedLeadLeftPolicy(state) {
   return groupLeftQueue(state, PHASES[state.phase]) > 0 ? FIXED_LEAD_LEFT_DURATION : 0;
@@ -188,13 +210,15 @@ export function createSimState(seed) {
     crossing: [],
     pedestrians: { N: [], S: [], E: [], W: [] },
     pedWaiting: { N: [], S: [], E: [], W: [] },
-    pedClosing: false,
-    pendingReason: null,
     pedTimer: { N: PED_RELEASE_INTERVAL, S: PED_RELEASE_INTERVAL, E: PED_RELEASE_INTERVAL, W: PED_RELEASE_INTERVAL },
     phase: "NS",
     phaseElapsed: 0,
     yellow: false,
     yellowElapsed: 0,
+    scramble: false,
+    scrambleElapsed: 0,
+    scramblePlanned: 0,
+    lastScrambleEnd: -SCRAMBLE_COOLDOWN,
     leadLeft: false,
     leadLeftElapsed: 0,
     leadLeftPlanned: 0,
@@ -207,6 +231,7 @@ export function createSimState(seed) {
     stats: {
       departed: { N: 0, S: 0, E: 0, W: 0 },
       totalWait: { N: 0, S: 0, E: 0, W: 0 },
+      scrambles: 0,
       pedServed: { N: 0, S: 0, E: 0, W: 0 },
       pedTotalWait: { N: 0, S: 0, E: 0, W: 0 },
       maxWait: 0,
@@ -388,26 +413,10 @@ function projectCost(state, arrivalRates, pedRate, switchNow) {
  * simulates both options forward instead of guessing from a static threshold.
  */
 export function adaptiveController(state, dt, arrivalRates, pedRate) {
-  const walkNow = walkLegs(state.phase);
-
-  // Pedestrian clearance: once a switch is decided, stop sending new
-  // pedestrians and wait (a few seconds) for the ones already crossing to
-  // finish, so cross traffic never gets green on top of them.
-  if (state.pedClosing) {
-    if (pedsCrossingOn(state, walkNow) > 0) return null;
-    const reason = state.pendingReason;
-    state.pedClosing = false;
-    state.pendingReason = null;
-    return reason ?? true;
-  }
-
-  const decision = decideSwitch(state, dt, arrivalRates, pedRate);
-  if (decision && pedsCrossingOn(state, walkNow) > 0) {
-    state.pedClosing = true;
-    state.pendingReason = typeof decision === "string" ? decision : null;
-    return null;
-  }
-  return decision;
+  // No waiting for crossing pedestrians here: the yellow itself is held until
+  // they finish (see stepSimulation), so the clearance runs alongside the
+  // yellow instead of adding to it.
+  return decideSwitch(state, dt, arrivalRates, pedRate);
 }
 
 function decideSwitch(state, dt, arrivalRates, pedRate) {
@@ -457,6 +466,12 @@ function decideSwitch(state, dt, arrivalRates, pedRate) {
     state.confidence = 65;
     return `${PHASE_LABEL[state.phase]} 방향 최대 녹색시간(${Math.round(maxGreen)}s) 도달 → 전환`;
   }
+  // A nearly idle green is wasted on the pedestrians stuck behind it.
+  if (greenQueue <= PED_IDLE_GREEN_QUEUE && pedsWaitingOn(state, walkNext) > 0) {
+    state.confidence = 85;
+    return `🚶 ${PHASE_LABEL[state.phase]} 방향 여유(${greenQueue}대) + 보행자 ${pedsWaitingOn(state, walkNext)}명 대기 → 조기 전환`;
+  }
+
   if (greenQueue === 0 && redQueue > 0) {
     state.confidence = 95;
     return `${PHASE_LABEL[state.phase]} 방향 대기 차량 없음 → 조기 전환`;
@@ -488,10 +503,23 @@ function decideSwitch(state, dt, arrivalRates, pedRate) {
 
 export function crosswalkWalkable(state, leg) {
   if (state.yellow) return false;
+  if (state.scramble) return true;
   // Lead-left is the one window where turning cars own the box; walking
-  // pedestrians there would just block the lefts it exists to clear.
-  if (state.leadLeft) return false;
+  // pedestrians there would just block the lefts it exists to clear. A signal
+  // that knows which lefts are actually queued (the adaptive one) can still
+  // walk the crosswalks none of them exit onto; a timer cannot.
+  if (state.leadLeft) return state.smartPedWalk && leadLeftLegFree(state, leg);
   return leg === "N" || leg === "S" ? state.phase === "EW" : state.phase === "NS";
+}
+
+function leadLeftLegFree(state, leg) {
+  if (!walkLegs(state.phase).includes(leg)) return false;
+  for (const a of PHASES[state.phase]) {
+    for (const item of state.queues[a].left) {
+      if (MOVEMENT_TARGET[a][item.movement] === leg) return false;
+    }
+  }
+  return !state.crossing.some((v) => (v.movement === "left" || v.movement === "uturn") && MOVEMENT_TARGET[v.approach][v.movement] === leg);
 }
 
 export function isCrosswalkOccupied(state, leg) {
@@ -538,8 +566,20 @@ function departVehicle(state, approach, lane) {
   });
 }
 
-export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPolicy, pedRate = DEFAULT_PED_RATE }) {
+function beginLeadLeft(state, leadLeftPolicy, arrivalRates) {
+  const duration = leadLeftPolicy ? leadLeftPolicy(state, arrivalRates) : 0;
+  state.leadLeft = duration > 0;
+  state.leadLeftElapsed = 0;
+  state.leadLeftPlanned = duration;
+}
+
+export function stepSimulation(
+  state,
+  dt,
+  { arrivalRates, controller, leadLeftPolicy, scramblePolicy, smartPedWalk = false, pedRate = DEFAULT_PED_RATE }
+) {
   state.time += dt;
+  state.smartPedWalk = smartPedWalk;
 
   // 1. Vehicle arrivals — also feeds the AI's own EWMA estimate of arrival
   // rate per approach (decay-then-impulse, converges to the true rate).
@@ -561,17 +601,36 @@ export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPo
   // 2. Signal phase / yellow / lead-left transition
   if (state.yellow) {
     state.yellowElapsed += dt;
-    if (state.yellowElapsed >= YELLOW_TIME) {
+    // The adaptive signal holds the yellow until pedestrians already on the
+    // crosswalks have cleared, so cross traffic never gets green on top of
+    // them; a timer cannot know they are there.
+    const pedsClearing = state.smartPedWalk && pedsCrossingOn(state, walkLegs(state.phase)) > 0;
+    if (state.yellowElapsed >= YELLOW_TIME && !pedsClearing) {
       state.yellow = false;
       state.yellowElapsed = 0;
       state.phase = otherPhase(state.phase);
       state.phaseElapsed = 0;
-      state.pedClosing = false;
-      state.pendingReason = null;
-      const duration = leadLeftPolicy ? leadLeftPolicy(state, arrivalRates) : 0;
-      state.leadLeft = duration > 0;
-      state.leadLeftElapsed = 0;
-      state.leadLeftPlanned = duration;
+      const scrambleDuration = scramblePolicy ? scramblePolicy(state, arrivalRates) : 0;
+      if (scrambleDuration > 0) {
+        state.scramble = true;
+        state.scrambleElapsed = 0;
+        state.scramblePlanned = scrambleDuration;
+        state.stats.scrambles++;
+        pushLog(
+          state,
+          `🚶 보행자 전용 신호: 대기 보행자 ${pedsWaitingOn(state, APPROACHES)}명 → 모든 방향 차량 정지, ${Math.round(scrambleDuration)}초`
+        );
+      } else {
+        beginLeadLeft(state, leadLeftPolicy, arrivalRates);
+      }
+    }
+  } else if (state.scramble) {
+    state.scrambleElapsed += dt;
+    const nobodyLeft = pedsWaitingOn(state, APPROACHES) + pedsCrossingOn(state, APPROACHES) === 0;
+    if (state.scrambleElapsed >= state.scramblePlanned || (state.scrambleElapsed >= 1 && nobodyLeft)) {
+      state.scramble = false;
+      state.lastScrambleEnd = state.time;
+      beginLeadLeft(state, leadLeftPolicy, arrivalRates);
     }
   } else if (state.leadLeft) {
     state.leadLeftElapsed += dt;
@@ -590,7 +649,7 @@ export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPo
   // window is to hold both approaches' through traffic so their lefts can
   // cross unimpeded).
   for (const a of APPROACHES) {
-    const isGreen = !state.yellow && !state.leadLeft && PHASES[state.phase].includes(a);
+    const isGreen = !state.yellow && !state.scramble && !state.leadLeft && PHASES[state.phase].includes(a);
     if (!isGreen) {
       state.serviceTimer[a].through = 0;
       continue;
@@ -610,7 +669,7 @@ export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPo
   // opposing approach isn't currently sending a car through the box (a rough
   // stand-in for "yield to oncoming traffic, take the gap when it appears").
   for (const a of APPROACHES) {
-    const inGroup = !state.yellow && PHASES[state.phase].includes(a);
+    const inGroup = !state.yellow && !state.scramble && PHASES[state.phase].includes(a);
     if (!inGroup) {
       state.serviceTimer[a].left = 0;
       continue;
@@ -651,6 +710,7 @@ export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPo
   // 5. Right turns flow independently of the signal, yielding only to a
   // pedestrian currently in the crosswalk they'd cross.
   for (const a of APPROACHES) {
+    if (state.scramble) continue;
     const exitLeg = MOVEMENT_TARGET[a].right;
     if (pedInExitLane(state, exitLeg)) continue;
     state.serviceTimer[a].right += dt;
@@ -686,7 +746,10 @@ export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPo
     }
 
     const waiting = state.pedWaiting[leg];
-    if (crosswalkWalkable(state, leg) && !state.pedClosing) {
+    // A scramble stops sending pedestrians early enough that they clear the
+    // crosswalks before cars get green again.
+    const scrambleClosing = state.scramble && state.scrambleElapsed >= state.scramblePlanned - PED_DURATION;
+    if (crosswalkWalkable(state, leg) && !scrambleClosing) {
       state.pedTimer[leg] = Math.min(state.pedTimer[leg] + dt, PED_RELEASE_INTERVAL);
       while (state.pedTimer[leg] >= PED_RELEASE_INTERVAL && waiting.length > 0) {
         state.pedTimer[leg] -= PED_RELEASE_INTERVAL;
@@ -710,6 +773,7 @@ export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPo
 }
 
 export function lightStateFor(state, approach) {
+  if (state.scramble) return "red";
   const isGreenGroup = PHASES[state.phase].includes(approach);
   if (!isGreenGroup) return "red";
   return state.yellow ? "yellow" : "green";
