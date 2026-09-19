@@ -3,6 +3,7 @@ import {
   adaptiveController,
   adaptiveLeadLeftPolicy,
   adaptiveScramblePolicy,
+  averagePedWait,
   averageWait,
   createSimState,
   fixedController,
@@ -76,6 +77,8 @@ export function useTrafficDuel({ scenarioId, speed, running, pedRate }) {
             t: aiRef.current.time,
             fixedAvg: averageWait(fixedRef.current),
             aiAvg: averageWait(aiRef.current),
+            fixedPedAvg: averagePedWait(fixedRef.current),
+            aiPedAvg: averagePedWait(aiRef.current),
           });
           if (historyRef.current.length > HISTORY_MAX_POINTS) historyRef.current.shift();
         }
