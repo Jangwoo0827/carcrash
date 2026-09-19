@@ -89,6 +89,21 @@ function CrossingVehicles({ crossing }) {
   });
 }
 
+
+const WAIT_SHOW_MAX = 10;
+
+/** Curb positions for pedestrians waiting to cross: bunched just outside the crosswalk's start. */
+function waitingSpot(geo, i) {
+  const dx = geo.to.x - geo.from.x;
+  const dy = geo.to.y - geo.from.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const ux = dx / len;
+  const uy = dy / len;
+  const back = 5 + (i % 5) * 3.2;
+  const side = Math.floor(i / 5) * 3.4;
+  return { x: geo.from.x - ux * back - uy * side, y: geo.from.y - uy * back + ux * side };
+}
+
 function Pedestrians({ state }) {
   const dots = [];
   for (const leg of APPROACHES) {
@@ -100,6 +115,11 @@ function Pedestrians({ state }) {
         <GltfModel key={p.id} url={MODEL_URLS.pedestrian} position={toScene({ x, y })} scale={PED_SCALE} />
       );
     }
+    state.pedWaiting[leg].slice(0, WAIT_SHOW_MAX).forEach((p, i) => {
+      dots.push(
+        <GltfModel key={p.id} url={MODEL_URLS.pedestrian} position={toScene(waitingSpot(geo, i))} scale={PED_SCALE} />
+      );
+    });
   }
   return dots;
 }

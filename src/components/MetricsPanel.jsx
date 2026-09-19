@@ -1,4 +1,11 @@
-import { averageWait, totalDeparted, totalQueued } from "../utils/trafficSim";
+import {
+  averagePedWait,
+  averageWait,
+  totalDeparted,
+  totalPedServed,
+  totalPedWaiting,
+  totalQueued,
+} from "../utils/trafficSim";
 
 export default function MetricsPanel({ fixed, ai }) {
   const fixedAvg = averageWait(fixed);
@@ -16,12 +23,14 @@ export default function MetricsPanel({ fixed, ai }) {
           <span className="metric-value">{fixedAvg.toFixed(1)}초</span>
           <span className="metric-sub">평균 대기시간 · 통과 {totalDeparted(fixed)}대</span>
           <span className="metric-sub muted">현재 대기 {totalQueued(fixed)}대</span>
+          <span className="metric-sub">🚶 보행자 평균 대기 {averagePedWait(fixed).toFixed(1)}초 · {totalPedServed(fixed)}명 (대기 중 {totalPedWaiting(fixed)}명)</span>
         </div>
         <div className="metric-col metric-col-ai">
           <span className="metric-label">AI 적응형</span>
           <span className="metric-value">{aiAvg.toFixed(1)}초</span>
           <span className="metric-sub">평균 대기시간 · 통과 {totalDeparted(ai)}대</span>
           <span className="metric-sub muted">현재 대기 {totalQueued(ai)}대</span>
+          <span className="metric-sub">🚶 보행자 평균 대기 {averagePedWait(ai).toFixed(1)}초 · {totalPedServed(ai)}명 (대기 중 {totalPedWaiting(ai)}명)</span>
         </div>
       </div>
 

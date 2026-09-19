@@ -8,7 +8,7 @@ export default function ApproachHud({ state }) {
           <span className={`hud-light hud-light-${lightStateFor(state, a)}`} />
           <span className="hud-approach-label">{APPROACH_LABEL[a]}</span>
           <span className="hud-stat">🚗{totalApproachQueue(state, a)}</span>
-          <span className="hud-stat">🚶{state.pedestrians[a].length}</span>
+          <span className="hud-stat">🚶{state.pedestrians[a].length + state.pedWaiting[a].length}</span>
         </div>
       ))}
     </div>

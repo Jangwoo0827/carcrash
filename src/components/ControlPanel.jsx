@@ -2,12 +2,16 @@ import { SCENARIO_LIST } from "../utils/scenarios";
 
 const SPEED_PRESETS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
 const MAX_SPEED = 1024;
+const PED_PRESETS = [0, 3, 7, 15, 20, 30];
+const MAX_PED_RATE = 30;
 
 export default function ControlPanel({
   scenarioId,
   onScenarioChange,
   speed,
   onSpeedChange,
+  pedRate,
+  onPedRateChange,
   running,
   onToggleRunning,
   onReset,
@@ -66,6 +70,44 @@ export default function ControlPanel({
             className="speed-number"
           />
           <span className="speed-unit">x</span>
+        </div>
+      </div>
+
+      <div className="control-group">
+        <span className="control-label">보행자 수 (횡단보도당 명/분, 최대 {MAX_PED_RATE})</span>
+        <div className="chip-row">
+          {PED_PRESETS.map((r) => (
+            <button
+              key={r}
+              className={`chip ${pedRate === r ? "chip-active" : ""}`}
+              onClick={() => onPedRateChange(r)}
+            >
+              {r}
+            </button>
+          ))}
+        </div>
+        <div className="speed-slider-row">
+          <input
+            type="range"
+            min="0"
+            max={MAX_PED_RATE}
+            step="1"
+            value={Math.min(MAX_PED_RATE, Math.round(pedRate))}
+            onChange={(e) => onPedRateChange(Number(e.target.value))}
+            className="speed-slider"
+          />
+          <input
+            type="number"
+            min="0"
+            max={MAX_PED_RATE}
+            value={pedRate}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              if (!Number.isNaN(v)) onPedRateChange(Math.max(0, Math.min(MAX_PED_RATE, v)));
+            }}
+            className="speed-number"
+          />
+          <span className="speed-unit">명/분</span>
         </div>
       </div>
 

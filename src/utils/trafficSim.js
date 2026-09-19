@@ -1,5 +1,5 @@
 import { mulberry32 } from "./random";
-import { APPROACHES, MOVEMENT_TARGET, buildPath } from "./geometry";
+import { APPROACH, APPROACHES, MOVEMENT_TARGET, buildPath, crosswalkGeometry } from "./geometry";
 
 export { APPROACHES };
 
@@ -70,8 +70,16 @@ const MOVEMENT_WEIGHTS = [
 ];
 const LANE_OF = { through: "through", left: "left", right: "right", uturn: "left" };
 
-const PED_RATE_PER_MIN = 7; // pedestrians/min per leg, while that crosswalk is walkable
+export const DEFAULT_PED_RATE = 7; // pedestrians/min per crosswalk (user-adjustable via slider)
 const PED_DURATION = 3.2; // seconds to cross
+const PED_RELEASE_INTERVAL = 0.25; // seconds between waiting pedestrians stepping off the curb (a crowd crosses together)
+const PED_COST_CAP = 20; // waiting pedestrians beyond this stop adding cost (a crowd crosses together, so it does not scale linearly)
+const PED_CROWD = 10; // waiting pedestrians on a leg that count as a crowd worth shortening lead-left for
+const PED_CROWD_LEAD_LEFT = 6; // seconds — the adaptive lead-left cap while a crowd is waiting
+const PED_WEIGHT = 1.5; // one waiting pedestrian counts like this many waiting cars in the AI's cost
+const PED_MIN_GREEN = 9; // seconds — a phase serving waiting pedestrians keeps green at least this long
+const PED_MAX_NEEDED = 26; // seconds — cap on green held just to drain a big crowd
+const PED_STARVATION_LIMIT = 40; // seconds — pedestrians shouldn't wait longer than this either
 
 export const FIXED_GREEN = 15; // baseline fixed-time cycle half-length
 
@@ -114,6 +122,35 @@ function groupLeftQueue(state, group) {
   return group.reduce((s, a) => s + state.queues[a].left.length, 0);
 }
 
+/** Legs whose crosswalk is walkable while `phase` is green (the perpendicular street's legs). */
+function walkLegs(phase) {
+  return phase === "NS" ? ["E", "W"] : ["N", "S"];
+}
+
+function pedsWaitingOn(state, legs) {
+  return legs.reduce((s, l) => s + state.pedWaiting[l].length, 0);
+}
+
+function pedsCrossingOn(state, legs) {
+  return legs.reduce((s, l) => s + state.pedestrians[l].length, 0);
+}
+
+/** Green a phase needs to walk the crowd on `legs` across: crossing time plus stepping them off the curb. */
+function pedGreenNeeded(state, legs) {
+  const waitingMax = Math.max(0, ...legs.map((l) => state.pedWaiting[l].length));
+  if (waitingMax + pedsCrossingOn(state, legs) === 0) return 0;
+  return Math.min(PED_MAX_NEEDED, Math.max(PED_MIN_GREEN, PED_DURATION + 2 + waitingMax * PED_RELEASE_INTERVAL));
+}
+
+function oldestPedWait(state, legs) {
+  let oldest = 0;
+  for (const l of legs) {
+    const q = state.pedWaiting[l];
+    if (q.length > 0) oldest = Math.max(oldest, state.time - q[0].spawnTime);
+  }
+  return oldest;
+}
+
 /** Dumb fixed-timing policy: always spend a flat window on lefts if any are waiting. */
 export function fixedLeadLeftPolicy(state) {
   return groupLeftQueue(state, PHASES[state.phase]) > 0 ? FIXED_LEAD_LEFT_DURATION : 0;
@@ -123,7 +160,10 @@ export function fixedLeadLeftPolicy(state) {
 export function adaptiveLeadLeftPolicy(state) {
   const q = groupLeftQueue(state, PHASES[state.phase]);
   if (q < ADAPTIVE_LEAD_LEFT_THRESHOLD) return 0;
-  return Math.min(LEAD_LEFT_MAX, q * LEAD_LEFT_HEADWAY);
+  const duration = Math.min(LEAD_LEFT_MAX, q * LEAD_LEFT_HEADWAY);
+  // Pedestrians can't walk during lead-left, so a crowd at the curb shortens it.
+  const crowd = Math.max(0, ...walkLegs(state.phase).map((l) => state.pedWaiting[l].length));
+  return crowd >= PED_CROWD ? Math.min(duration, PED_CROWD_LEAD_LEFT) : duration;
 }
 
 function pickMovement(rng) {
@@ -147,6 +187,10 @@ export function createSimState(seed) {
     serviceTimer: { N: zeroLanes(), S: zeroLanes(), E: zeroLanes(), W: zeroLanes() },
     crossing: [],
     pedestrians: { N: [], S: [], E: [], W: [] },
+    pedWaiting: { N: [], S: [], E: [], W: [] },
+    pedClosing: false,
+    pendingReason: null,
+    pedTimer: { N: PED_RELEASE_INTERVAL, S: PED_RELEASE_INTERVAL, E: PED_RELEASE_INTERVAL, W: PED_RELEASE_INTERVAL },
     phase: "NS",
     phaseElapsed: 0,
     yellow: false,
@@ -163,6 +207,8 @@ export function createSimState(seed) {
     stats: {
       departed: { N: 0, S: 0, E: 0, W: 0 },
       totalWait: { N: 0, S: 0, E: 0, W: 0 },
+      pedServed: { N: 0, S: 0, E: 0, W: 0 },
+      pedTotalWait: { N: 0, S: 0, E: 0, W: 0 },
       maxWait: 0,
       log: [],
     },
@@ -234,7 +280,7 @@ function computeConfidence(greenQueue, redQueue) {
   return Math.max(8, Math.min(97, Math.round(50 + Math.abs(redQueue - greenQueue) * 6)));
 }
 
-function logThought(state, greenQueue, redQueue, plan) {
+function logThought(state, greenQueue, redQueue, plan, pedWaitCount = 0) {
   if (state.time - state.lastThoughtAt < THOUGHT_INTERVAL) return;
   state.lastThoughtAt = state.time;
 
@@ -252,12 +298,13 @@ function logThought(state, greenQueue, redQueue, plan) {
   const planNote = plan
     ? ` · 가상실행: 유지 ${plan.costHold.toFixed(0)} vs 전환 ${plan.costSwitch.toFixed(0)}`
     : "";
+  const pedNote = pedWaitCount > 0 ? ` · 🚶대기 ${pedWaitCount}명` : "";
 
   for (const a of APPROACHES) state.queueSnapshot[a] = approachQueueLength(state, a);
 
   pushLog(
     state,
-    `[${PHASE_LABEL[state.phase]} 진행 ${Math.floor(state.phaseElapsed)}s] 현재측 ${greenTrend} · 반대측 ${redTrend} (${LOOKAHEAD}초 후 예상 유입 ${inflowPct >= 0 ? "+" : ""}${inflowPct}%)${planNote} · 확신도 ${state.confidence}% → 유지`,
+    `[${PHASE_LABEL[state.phase]} 진행 ${Math.floor(state.phaseElapsed)}s] 현재측 ${greenTrend} · 반대측 ${redTrend} (${LOOKAHEAD}초 후 예상 유입 ${inflowPct >= 0 ? "+" : ""}${inflowPct}%)${planNote}${pedNote} · 확신도 ${state.confidence}% → 유지`,
     "thought"
   );
 }
@@ -280,7 +327,7 @@ function logThought(state, greenQueue, redQueue, plan) {
  * same continuous arrival rate and differs only in which side is served when,
  * which is the only thing this decision actually controls.
  */
-function projectCost(state, arrivalRates, switchNow) {
+function projectCost(state, arrivalRates, pedRate, switchNow) {
   let phase = state.phase;
   let phaseElapsed = state.phaseElapsed;
   let yellow = state.yellow;
@@ -292,6 +339,10 @@ function projectCost(state, arrivalRates, switchNow) {
 
   const queue = {};
   for (const a of APPROACHES) queue[a] = approachQueueLength(state, a);
+  const pedQueue = {};
+  for (const a of APPROACHES) pedQueue[a] = state.pedWaiting[a].length;
+  const pedArrival = (pedRate ?? 0) / 60; // pedestrians/sec per crosswalk
+  const pedService = 1 / PED_RELEASE_INTERVAL;
   const arrivalRate = (a) => (arrivalRates[a] ?? 0) / 60; // cars/sec
   const serviceRate = 1 / HEADWAY_THROUGH; // cars/sec cleared while green
 
@@ -316,6 +367,12 @@ function projectCost(state, arrivalRates, switchNow) {
       }
       // Area under the queue-length curve ~ total vehicle-seconds of delay.
       cost += queue[a] * PLAN_STEP;
+
+      // Pedestrians on this leg cross while the perpendicular phase is green.
+      const walkable = !yellow && walkLegs(phase).includes(a);
+      pedQueue[a] = Math.max(0, pedQueue[a] + pedArrival * PLAN_STEP);
+      if (walkable) pedQueue[a] = Math.max(0, pedQueue[a] - pedService * PLAN_STEP);
+      cost += PED_WEIGHT * Math.min(pedQueue[a], PED_COST_CAP) * PLAN_STEP;
     }
   }
   return cost;
@@ -330,7 +387,30 @@ function projectCost(state, arrivalRates, switchNow) {
  * "is this actually worth switching for" judgment call — a mini-MPC that
  * simulates both options forward instead of guessing from a static threshold.
  */
-export function adaptiveController(state, dt, arrivalRates) {
+export function adaptiveController(state, dt, arrivalRates, pedRate) {
+  const walkNow = walkLegs(state.phase);
+
+  // Pedestrian clearance: once a switch is decided, stop sending new
+  // pedestrians and wait (a few seconds) for the ones already crossing to
+  // finish, so cross traffic never gets green on top of them.
+  if (state.pedClosing) {
+    if (pedsCrossingOn(state, walkNow) > 0) return null;
+    const reason = state.pendingReason;
+    state.pedClosing = false;
+    state.pendingReason = null;
+    return reason ?? true;
+  }
+
+  const decision = decideSwitch(state, dt, arrivalRates, pedRate);
+  if (decision && pedsCrossingOn(state, walkNow) > 0) {
+    state.pedClosing = true;
+    state.pendingReason = typeof decision === "string" ? decision : null;
+    return null;
+  }
+  return decision;
+}
+
+function decideSwitch(state, dt, arrivalRates, pedRate) {
   const green = PHASES[state.phase];
   const red = PHASES[otherPhase(state.phase)];
   const greenQueue = green.reduce((s, a) => s + approachQueueLength(state, a), 0);
@@ -355,8 +435,21 @@ export function adaptiveController(state, dt, arrivalRates) {
     return `⚖️ 공정성 개입: ${PHASE_LABEL[otherPhase(state.phase)]} 방향 차량이 ${Math.round(redOldestWait)}초째 대기 → 즉시 전환`;
   }
 
-  const minGreen = dynamicMinGreen(arrivalRates, green);
+  // Pedestrians get the same guarantee. Pedestrians waiting right now are on
+  // the legs that only become walkable once this phase ends.
+  const walkNow = walkLegs(state.phase);
+  const walkNext = walkLegs(otherPhase(state.phase));
+  const pedOldest = oldestPedWait(state, walkNext);
+  const pedNeeded = pedGreenNeeded(state, walkNow);
+  if (pedOldest >= PED_STARVATION_LIMIT && state.phaseElapsed >= Math.max(STARVATION_MIN_SERVE, pedNeeded)) {
+    state.confidence = 92;
+    return `🚶 보행자 보호: 횡단보도 보행자가 ${Math.round(pedOldest)}초째 대기 → 보행 신호로 전환`;
+  }
+
+  let minGreen = dynamicMinGreen(arrivalRates, green);
   const maxGreen = dynamicMaxGreen(arrivalRates, red);
+  // Pedestrians being served this phase need enough green to actually cross.
+  minGreen = Math.max(minGreen, pedNeeded);
 
   if (state.phaseElapsed < minGreen) return null;
 
@@ -370,13 +463,13 @@ export function adaptiveController(state, dt, arrivalRates) {
   }
 
   if (!arrivalRates || state.time - state.lastPlanAt < PLAN_INTERVAL) {
-    logThought(state, greenQueue, redQueue);
+    logThought(state, greenQueue, redQueue, undefined, pedsWaitingOn(state, walkNext));
     return null;
   }
   state.lastPlanAt = state.time;
 
-  const costHold = projectCost(state, arrivalRates, false);
-  const costSwitch = projectCost(state, arrivalRates, true);
+  const costHold = projectCost(state, arrivalRates, pedRate, false);
+  const costSwitch = projectCost(state, arrivalRates, pedRate, true);
   const redForecast = red.reduce((s, a) => s + forecastQueueLength(state, a, LOOKAHEAD), 0);
 
   if (costSwitch < costHold * PLAN_MARGIN) {
@@ -389,17 +482,45 @@ export function adaptiveController(state, dt, arrivalRates) {
     );
   }
 
-  logThought(state, greenQueue, redQueue, { costHold, costSwitch, redForecast });
+  logThought(state, greenQueue, redQueue, { costHold, costSwitch, redForecast }, pedsWaitingOn(state, walkNext));
   return null;
 }
 
 export function crosswalkWalkable(state, leg) {
   if (state.yellow) return false;
+  // Lead-left is the one window where turning cars own the box; walking
+  // pedestrians there would just block the lefts it exists to clear.
+  if (state.leadLeft) return false;
   return leg === "N" || leg === "S" ? state.phase === "EW" : state.phase === "NS";
 }
 
 export function isCrosswalkOccupied(state, leg) {
   return state.pedestrians[leg].some((p) => p.progress > 0.02 && p.progress < 0.98);
+}
+
+const PED_CONFLICT_RADIUS = 14; // px — how close a pedestrian must be to a vehicle's exit lane to block it
+
+/**
+ * Cars leaving onto `leg` only cross the crosswalk in their own outbound lane,
+ * so a pedestrian on the far half of the crosswalk doesn't block them.
+ */
+function pedInExitLane(state, leg) {
+  const geo = crosswalkGeometry(leg);
+  const off = APPROACH[leg].outboundOffset;
+  const px = geo.center.x + off.x;
+  const py = geo.center.y + off.y;
+  return state.pedestrians[leg].some((p) => {
+    if (p.progress <= 0.02 || p.progress >= 0.98) return false;
+    const x = geo.from.x + (geo.to.x - geo.from.x) * p.progress;
+    const y = geo.from.y + (geo.to.y - geo.from.y) * p.progress;
+    return Math.hypot(x - px, y - py) < PED_CONFLICT_RADIUS;
+  });
+}
+
+/** A left-turner (or U-turner) waits while a pedestrian is in the crosswalk it would cross. */
+function leftBlockedByPed(state, approach) {
+  const front = state.queues[approach].left[0];
+  return !!front && pedInExitLane(state, MOVEMENT_TARGET[approach][front.movement]);
 }
 
 function departVehicle(state, approach, lane) {
@@ -417,7 +538,7 @@ function departVehicle(state, approach, lane) {
   });
 }
 
-export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPolicy }) {
+export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPolicy, pedRate = DEFAULT_PED_RATE }) {
   state.time += dt;
 
   // 1. Vehicle arrivals — also feeds the AI's own EWMA estimate of arrival
@@ -445,6 +566,8 @@ export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPo
       state.yellowElapsed = 0;
       state.phase = otherPhase(state.phase);
       state.phaseElapsed = 0;
+      state.pedClosing = false;
+      state.pendingReason = null;
       const duration = leadLeftPolicy ? leadLeftPolicy(state, arrivalRates) : 0;
       state.leadLeft = duration > 0;
       state.leadLeftElapsed = 0;
@@ -458,7 +581,7 @@ export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPo
     }
   } else {
     state.phaseElapsed += dt;
-    const decision = controller(state, dt, arrivalRates);
+    const decision = controller(state, dt, arrivalRates, pedRate);
     if (decision) switchPhase(state, typeof decision === "string" ? decision : null);
   }
 
@@ -493,8 +616,12 @@ export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPo
       continue;
     }
     if (state.leadLeft) {
-      state.serviceTimer[a].left += dt;
-      while (state.serviceTimer[a].left >= LEAD_LEFT_HEADWAY && state.queues[a].left.length > 0) {
+      state.serviceTimer[a].left = Math.min(state.serviceTimer[a].left + dt, LEAD_LEFT_HEADWAY);
+      while (
+        state.serviceTimer[a].left >= LEAD_LEFT_HEADWAY &&
+        state.queues[a].left.length > 0 &&
+        !leftBlockedByPed(state, a)
+      ) {
         state.serviceTimer[a].left -= LEAD_LEFT_HEADWAY;
         departVehicle(state, a, "left");
       }
@@ -509,8 +636,12 @@ export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPo
       state.serviceTimer[a].left = 0;
       continue;
     }
-    state.serviceTimer[a].left += dt;
-    while (state.serviceTimer[a].left >= HEADWAY_TURN && state.queues[a].left.length > 0) {
+    state.serviceTimer[a].left = Math.min(state.serviceTimer[a].left + dt, HEADWAY_TURN);
+    while (
+      state.serviceTimer[a].left >= HEADWAY_TURN &&
+      state.queues[a].left.length > 0 &&
+      !leftBlockedByPed(state, a)
+    ) {
       state.serviceTimer[a].left -= HEADWAY_TURN;
       departVehicle(state, a, "left");
     }
@@ -521,7 +652,7 @@ export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPo
   // pedestrian currently in the crosswalk they'd cross.
   for (const a of APPROACHES) {
     const exitLeg = MOVEMENT_TARGET[a].right;
-    if (isCrosswalkOccupied(state, exitLeg)) continue;
+    if (pedInExitLane(state, exitLeg)) continue;
     state.serviceTimer[a].right += dt;
     while (state.serviceTimer[a].right >= HEADWAY_TURN && state.queues[a].right.length > 0) {
       state.serviceTimer[a].right -= HEADWAY_TURN;
@@ -543,16 +674,31 @@ export function stepSimulation(state, dt, { arrivalRates, controller, leadLeftPo
     }
   }
 
-  // 7. Pedestrians: spawn while their crosswalk is walkable, advance while crossing
+  // 7. Pedestrians: arrive at the curb whether or not they can cross, wait
+  // there, and step off (one every PED_RELEASE_INTERVAL) once their crosswalk
+  // is walkable; crossing pedestrians advance regardless.
   for (const leg of APPROACHES) {
-    if (crosswalkWalkable(state, leg)) {
-      let expected = (PED_RATE_PER_MIN / 60) * dt;
-      while (expected > 0) {
-        const chunk = Math.min(expected, 1);
-        if (state.rng() < chunk) state.pedestrians[leg].push({ id: state.nextId++, progress: 0 });
-        expected -= 1;
-      }
+    let expected = (pedRate / 60) * dt;
+    while (expected > 0) {
+      const chunk = Math.min(expected, 1);
+      if (state.rng() < chunk) state.pedWaiting[leg].push({ id: state.nextId++, spawnTime: state.time });
+      expected -= 1;
     }
+
+    const waiting = state.pedWaiting[leg];
+    if (crosswalkWalkable(state, leg) && !state.pedClosing) {
+      state.pedTimer[leg] = Math.min(state.pedTimer[leg] + dt, PED_RELEASE_INTERVAL);
+      while (state.pedTimer[leg] >= PED_RELEASE_INTERVAL && waiting.length > 0) {
+        state.pedTimer[leg] -= PED_RELEASE_INTERVAL;
+        const w = waiting.shift();
+        state.pedestrians[leg].push({ id: w.id, progress: 0 });
+        state.stats.pedServed[leg]++;
+        state.stats.pedTotalWait[leg] += state.time - w.spawnTime;
+      }
+    } else {
+      state.pedTimer[leg] = PED_RELEASE_INTERVAL;
+    }
+
     const peds = state.pedestrians[leg];
     for (let i = peds.length - 1; i >= 0; i--) {
       peds[i].progress += dt / PED_DURATION;
@@ -594,4 +740,18 @@ export function averageWait(state) {
 
 export function totalQueued(state) {
   return APPROACHES.reduce((s, a) => s + totalApproachQueue(state, a), 0);
+}
+
+export function totalPedServed(state) {
+  return APPROACHES.reduce((s, a) => s + state.stats.pedServed[a], 0);
+}
+
+export function averagePedWait(state) {
+  const served = totalPedServed(state);
+  if (served === 0) return 0;
+  return APPROACHES.reduce((s, a) => s + state.stats.pedTotalWait[a], 0) / served;
+}
+
+export function totalPedWaiting(state) {
+  return APPROACHES.reduce((s, a) => s + state.pedWaiting[a].length, 0);
 }

@@ -20,7 +20,7 @@ const TICK_MS = 33; // setInterval, not requestAnimationFrame — keeps firing i
 const HISTORY_SAMPLE_INTERVAL = 3; // sim-seconds between comparison-chart samples
 const HISTORY_MAX_POINTS = 240;
 
-export function useTrafficDuel({ scenarioId, speed, running }) {
+export function useTrafficDuel({ scenarioId, speed, running, pedRate }) {
   const seedRef = useRef(Math.floor(Math.random() * 1e9));
   const fixedRef = useRef(createSimState(seedRef.current));
   const aiRef = useRef(createSimState(seedRef.current));
@@ -57,11 +57,13 @@ export function useTrafficDuel({ scenarioId, speed, running }) {
             arrivalRates: rates,
             controller: fixedController,
             leadLeftPolicy: fixedLeadLeftPolicy,
+            pedRate,
           });
           stepSimulation(aiRef.current, subDt, {
             arrivalRates: rates,
             controller: adaptiveController,
             leadLeftPolicy: adaptiveLeadLeftPolicy,
+            pedRate,
           });
         }
 
@@ -87,7 +89,7 @@ export function useTrafficDuel({ scenarioId, speed, running }) {
       clearInterval(id);
       lastTickRef.current = null;
     };
-  }, [running, speed, scenarioId]);
+  }, [running, speed, scenarioId, pedRate]);
 
   return { fixed: fixedRef.current, ai: aiRef.current, history: historyRef.current, reset };
 }

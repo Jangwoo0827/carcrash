@@ -7,15 +7,17 @@ import MetricsPanel from "./components/MetricsPanel";
 import AiLog from "./components/AiLog";
 import ComparisonChart from "./components/ComparisonChart";
 import { useTrafficDuel } from "./hooks/useTrafficDuel";
+import { DEFAULT_PED_RATE } from "./utils/trafficSim";
 
 export default function App() {
   const [scenarioId, setScenarioId] = useState("normal");
   const [speed, setSpeed] = useState(2);
+  const [pedRate, setPedRate] = useState(DEFAULT_PED_RATE);
   const [running, setRunning] = useState(true);
   const [viewMode, setViewMode] = useState("3d");
   const [expanded, setExpanded] = useState(null); // null | "fixed" | "ai"
 
-  const { fixed, ai, history, reset } = useTrafficDuel({ scenarioId, speed, running });
+  const { fixed, ai, history, reset } = useTrafficDuel({ scenarioId, speed, running, pedRate });
 
   function handleReset() {
     reset();
@@ -37,6 +39,8 @@ export default function App() {
         onScenarioChange={setScenarioId}
         speed={speed}
         onSpeedChange={setSpeed}
+        pedRate={pedRate}
+        onPedRateChange={setPedRate}
         running={running}
         onToggleRunning={() => setRunning((r) => !r)}
         onReset={handleReset}
